@@ -89,7 +89,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Instruction variants per role (default: all 5)",
     )
     p.add_argument("--axis_max_tokens", type=int, default=512)
-    p.add_argument("--axis_batch_size", type=int, default=16)
+    p.add_argument(
+        "--axis_batch_size", type=int, default=16, help="HF generation batch"
+    )
+    p.add_argument(
+        "--act_batch_size",
+        type=int,
+        default=4,
+        help="2_activations.py batch; it stacks all layers on GPU, so keep small",
+    )
     p.add_argument(
         "--min_count",
         type=int,
@@ -444,7 +452,7 @@ def stage_axis(args, models: Models):
         "--output_dir",
         acts,
         "--batch_size",
-        args.axis_batch_size,
+        args.act_batch_size,
         "--roles",
         *roles,
     )
