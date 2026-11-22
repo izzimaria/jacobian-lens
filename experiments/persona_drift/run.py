@@ -31,6 +31,7 @@ import importlib.util
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -73,6 +74,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--n_fit_prompts", type=int, default=100)
     p.add_argument("--fit_seq_len", type=int, default=128)
     p.add_argument("--dim_batch", type=int, default=8)
+    p.add_argument(
+        "--scratch_dir",
+        type=Path,
+        default=None,
+        help="Local dir for bulky intermediates (fit checkpoint, axis activations) "
+        "when --out is a synced folder such as Colab Drive (default: --out)",
+    )
+    p.add_argument(
+        "--fit_sync_every",
+        type=int,
+        default=0,
+        help="With --scratch_dir: also copy the fit checkpoint to --out every N "
+        "prompts (0 = never)",
+    )
     # axis
     p.add_argument(
         "--axis_roles",
@@ -242,15 +257,40 @@ def stage_fit(args, models: Models):
         args.fit_seq_len,
         args.dim_batch,
     )
-    lens = jlens.fit(
-        lens_model,
-        prompts,
-        dim_batch=args.dim_batch,
-        max_seq_len=args.fit_seq_len,
-        checkpoint_path=str(args.out / "lens_ckpt.pt"),
-    )
+    # On a synced folder (Colab Drive) every rewrite of the ~1.3 GB checkpoint
+    # leaves a trashed copy, so checkpoint to --scratch_dir and mirror to
+    # --out only every --fit_sync_every prompts.
+    synced = args.out / "lens_ckpt.pt"
+    ckpt = args.scratch_dir / "lens_ckpt.pt" if args.scratch_dir else synced
+    step = len(prompts)
+    done = 0
+    if ckpt != synced:
+        ckpt.parent.mkdir(parents=True, exist_ok=True)
+        if synced.exists() and not ckpt.exists():
+            log.info("copying %s -> %s", synced, ckpt)
+            shutil.copyfile(synced, ckpt)
+        if ckpt.exists():
+            done = torch.load(ckpt, map_location="cpu", mmap=True, weights_only=True)[
+                "n_done"
+            ]
+        step = args.fit_sync_every or len(prompts)
+    for end in range(step, len(prompts) + step, step):
+        end = min(end, len(prompts))
+        lens = jlens.fit(
+            lens_model,
+            prompts[:end],
+            dim_batch=args.dim_batch,
+            max_seq_len=args.fit_seq_len,
+            checkpoint_path=str(ckpt),
+        )
+        if ckpt != synced and end < len(prompts) and lens.n_prompts > done:
+            log.info("syncing checkpoint (%d prompts) -> %s", lens.n_prompts, synced)
+            shutil.copyfile(ckpt, synced)
+            done = lens.n_prompts
     lens.save(str(path))
     log.info("saved %r -> %s", lens, path)
+    if ckpt != synced and synced.exists():
+        synced.unlink()
 
 
 # --------------------------------------------------------------------------- #
@@ -404,6 +444,8 @@ def stage_axis(args, models: Models):
     responses, acts, scores, vectors = (
         work / d for d in ("responses", "activations", "scores", "vectors")
     )
+    if args.scratch_dir:
+        acts = (args.scratch_dir / "axis_activations").resolve()
     for d in (responses, acts, scores, vectors):
         d.mkdir(parents=True, exist_ok=True)
     roles = _axis_roles(args)

@@ -27,7 +27,7 @@ This experiment links two codebases:
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/izzimaria/jacobian-lens/blob/devin/1795312846-persona-drift/experiments/persona_drift/colab.ipynb)
 
-`colab.ipynb`: pick an **L4** runtime, optionally add `OPENAI_API_KEY` under Colab Secrets, then **Run all**. Output goes to Google Drive, so after a disconnect you can choose *Run all* again and it resumes. Defaults: 100 lens-fit prompts and a fixed-seed sample of 100 roles × 5 variants × 10 questions for the axis. Generation uses batched HF `generate` because Colab has no vLLM.
+`colab.ipynb`: pick an **L4** runtime, optionally add `OPENAI_API_KEY` under Colab Secrets, then **Run all**. Output goes to Google Drive, so after a disconnect you can choose *Run all* again and it resumes. To keep Drive usage to about 1 GB, `--scratch_dir /content/scratch` keeps the 1.3 GB fit checkpoint and the axis activations on the Colab disk (a disconnect mid-fit restarts the fit; pass `--fit_sync_every N` to copy the checkpoint to Drive every N prompts). Defaults: 100 lens-fit prompts and a fixed-seed sample of 100 roles × 5 variants × 10 questions for the axis. Generation uses batched HF `generate` because Colab has no vLLM.
 
 ## Setup
 
