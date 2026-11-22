@@ -272,10 +272,43 @@ def _axis_roles(args) -> list[str]:
     return sorted(set(roles) | {"default"})
 
 
+@torch.no_grad()
+def generate_batch(
+    hf, tok, convs, model_name, *, max_new_tokens, temperature=0.7, top_p=0.9
+) -> list[str]:
+    """Left-padded batched sampling; same template/sampling as assistant_axis.generate_response."""
+    prompts = [
+        tok.apply_chat_template(
+            c, tokenize=False, add_generation_prompt=True, **chat_kwargs(model_name)
+        )
+        for c in convs
+    ]
+    side, tok.padding_side = tok.padding_side, "left"
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    try:
+        enc = tok(prompts, return_tensors="pt", padding=True, add_special_tokens=False)
+    finally:
+        tok.padding_side = side
+    enc = enc.to(hf.device)
+    out = hf.generate(
+        **enc,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        pad_token_id=tok.pad_token_id,
+    )
+    return [
+        tok.decode(o[enc.input_ids.shape[1] :], skip_special_tokens=True).strip()
+        for o in out
+    ]
+
+
 def _generate_hf(args, models: Models, roles, responses_dir: Path):
     """HF fallback for 1_generate.py (no vLLM): same prompts, same JSONL schema."""
     import jsonlines
-    from assistant_axis import generate_response, get_config
+    from assistant_axis import get_config
     from assistant_axis.generation import format_conversation
 
     hf, tok, _ = models.get()
@@ -301,18 +334,29 @@ def _generate_hf(args, models: Models, roles, responses_dir: Path):
             for i in data["instruction"]
         ]
         idxs = args.axis_prompt_indices or range(len(instructions))
+        jobs = [
+            (
+                p_idx,
+                q_idx,
+                question,
+                format_conversation(instructions[p_idx], question, tok),
+            )
+            for p_idx in idxs
+            for q_idx, question in enumerate(questions)
+        ]
         rows = []
-        for p_idx in idxs:
-            for q_idx, question in enumerate(questions):
-                conv = format_conversation(instructions[p_idx], question, tok)
-                resp = generate_response(
-                    hf,
-                    tok,
-                    conv,
-                    max_new_tokens=args.axis_max_tokens,
-                    temperature=0.7,
-                    top_p=0.9,
-                )
+        for b in range(0, len(jobs), args.axis_batch_size):
+            batch = jobs[b : b + args.axis_batch_size]
+            resps = generate_batch(
+                hf,
+                tok,
+                [conv for *_, conv in batch],
+                args.model,
+                max_new_tokens=args.axis_max_tokens,
+                temperature=0.7,
+                top_p=0.9,
+            )
+            for (p_idx, q_idx, question, conv), resp in zip(batch, resps, strict=True):
                 rows.append(
                     {
                         "system_prompt": instructions[p_idx],

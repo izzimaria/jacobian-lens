@@ -17,10 +17,17 @@ This experiment links two codebases:
 | --- | --- |
 | `run.py` | Pipeline: `fit -> axis -> sweep -> readout -> analyze` (each stage resumable, skipped if its output exists) |
 | `analysis.py` | Metrics + figures (`summary.json`, `figures/*.png`) |
+| `colab.ipynb` | One-click Colab (L4) run of the whole pipeline, output on Google Drive |
 | `compat.py` | transformers-5 shim for assistant-axis `apply_chat_template` |
 | `persona_drift.ipynb` | Reproduces the figures from a run's `--out` directory |
 | `probes.json` | Fixed probe battery: identity, open-ended, harmlessness (4 each) |
 | `token_sets.json` | Tracked token sets: `persona` and `assistant` words |
+
+## Colab (one click)
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/izzimaria/jacobian-lens/blob/devin/1795312846-persona-drift/experiments/persona_drift/colab.ipynb)
+
+`colab.ipynb`: pick an **L4** runtime, optionally add `OPENAI_API_KEY` under Colab Secrets, then **Run all**. Output goes to Google Drive, so after a disconnect you can choose *Run all* again and it resumes. Defaults: 100 lens-fit prompts and a fixed-seed sample of 100 roles × 5 variants × 10 questions for the axis. Generation uses batched HF `generate` because Colab has no vLLM.
 
 ## Setup
 
