@@ -1,0 +1,7 @@
+{
+ "persona": ["human", "person", "soul", "spirit", "heart", "dream", "dreams", "journey", "ancient", "wanderer",
+             "mystic", "cosmic", "universe", "alive", "body", "born", "memories", "childhood", "flesh", "mortal",
+             "traveler", "poet", "sage", "storyteller", "whisper", "eternal", "myself"],
+ "assistant": ["assistant", "AI", "help", "helpful", "model", "language", "Qwen", "Alibaba", "artificial",
+               "designed", "programmed", "chatbot"]
+}
