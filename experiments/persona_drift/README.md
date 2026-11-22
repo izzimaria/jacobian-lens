@@ -17,6 +17,7 @@ This experiment links two codebases:
 | --- | --- |
 | `run.py` | Pipeline: `fit -> axis -> sweep -> readout -> analyze` (each stage resumable, skipped if its output exists) |
 | `analysis.py` | Metrics + figures (`summary.json`, `figures/*.png`) |
+| `compat.py` | transformers-5 shim for assistant-axis `apply_chat_template` |
 | `persona_drift.ipynb` | Reproduces the figures from a run's `--out` directory |
 | `probes.json` | Fixed probe battery: identity, open-ended, harmlessness (4 each) |
 | `token_sets.json` | Tracked token sets: `persona` and `assistant` words |
@@ -102,3 +103,34 @@ Outputs in `--out`:
   (`first_emit_pos`); `frac_band_before_emit` and `median_lead_tokens` per `s`.
 
 ## Results
+
+**Status: only a CPU smoke run so far. No 7B results yet.** The smoke run used
+`Qwen/Qwen2.5-0.5B-Instruct` (24 layers, band 8–16, steering layer 12), a lens fitted on 2 wikitext
+prompts of 48 tokens, an unjudged axis from 4 roles (pirate, mystic, ghost, poet) × 2 questions,
+`s ∈ {-8, -2, 0, +2}`, 12 probes per strength, 40-token responses, and 2 organic therapy turns.
+It shows that every stage runs end to end. The numbers below show the plumbing works; they are not
+findings.
+
+| s | proj @ L12 | persona band hit rate | persona band median rank | persona emitted rate | assistant band median rank |
+|---|---|---|---|---|---|
+| −8 | −17.3 | 0.69 | 4 | 0.035 | 1866 |
+| −2 | −3.7 | 0.26 | 27 | 0.018 | 110 |
+| 0 | 0.9 | 0.15 | 77 | 0.004 | 72 |
+| +2 | 5.0 | 0.14 | 91 | 0.012 | 108 |
+
+- (a) The projection is linear in `s`, so steering and readout use the same axis.
+- (d) The axis projection jumps at the injection layer (12), as expected. Persona lens-readability
+  rises only after it: it starts at layer 13 and peaks near layer 19, with a +0.66 hit-rate gain at s = −8.
+- At s = −8, persona words are lens-readable in the band about 20× more often than they are emitted
+  (0.69 vs 0.035), and the assistant set falls out of the band.
+- **The lead question is not answered yet.** `frac_band_before_emit` is already 0.92 at s = 0,
+  because a 2-prompt lens makes many band hits on its own. So "band before emission" does not
+  separate steered from unsteered runs at this scale. For the real run, compare against the s = 0
+  baseline, not the absolute fraction.
+
+Next: the full run on one GPU (Qwen2.5-7B-Instruct, `--n_fit_prompts 100`+, default strengths, all
+roles, `OPENAI_API_KEY` set so the judge filters role samples).
+
+**transformers 5 note.** assistant-axis expects `apply_chat_template(tokenize=True)` to return
+`list[int]` (transformers 4). `compat.py` restores that default, both in-process and for the pipeline
+scripts, so the fork stays unmodified.

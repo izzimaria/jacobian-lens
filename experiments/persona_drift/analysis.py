@@ -280,6 +280,8 @@ def fig_band_hit_vs_position(
 def fig_layer_profiles(meta, rs, hit_rank: int, axes=None):
     """(d) per-layer delta projection vs delta persona readability (relative to s=0)."""
     prof = layer_profiles(meta, rs, hit_rank)
+    if 0.0 not in prof:
+        return None
     layers = steered(rs)[0]["layers"]
     if axes is None:
         _, axes = plt.subplots(1, 2, figsize=(11, 3.5))

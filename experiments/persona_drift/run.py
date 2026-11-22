@@ -42,6 +42,11 @@ import jlens
 from jlens.hooks import ActivationRecorder
 from jlens.vis import _ranks_of, build_page, compute_slice
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from compat import patch_apply_chat_template  # noqa: E402
+
+patch_apply_chat_template()
+
 HERE = Path(__file__).resolve().parent
 log = logging.getLogger("persona_drift")
 
@@ -248,6 +253,7 @@ def stage_fit(args, models: Models):
 def _run_pipeline_script(args, script: str, *script_args):
     cmd = [
         sys.executable,
+        str(HERE / "compat.py"),
         str(args.assistant_axis_dir / "pipeline" / script),
         *map(str, script_args),
     ]
@@ -518,6 +524,20 @@ def stage_sweep(args, models: Models):
         return
     from assistant_axis import generate_response
 
+    organic_dir = args.assistant_axis_dir / "transcripts/persona_drift"
+    names = (
+        args.organic
+        if args.organic is not None
+        else sorted(p.stem for p in organic_dir.glob("*.json"))
+    )
+    organic = {}
+    for name in names:
+        src = json.loads((organic_dir / f"{name}.json").read_text())
+        user_turns = [t["content"] for t in src["conversation"] if t["role"] == "user"][
+            : args.organic_turns
+        ]
+        organic[name] = (src, user_turns)
+
     hf, tok, _ = models.get()
     bundle, layer, scale = load_axis_bundle(args)
     probes = json.loads(Path(args.probes).read_text())
@@ -556,17 +576,7 @@ def stage_sweep(args, models: Models):
                         resp[:80].replace("\n", " "),
                     )
 
-    organic_dir = args.assistant_axis_dir / "transcripts/persona_drift"
-    names = (
-        args.organic
-        if args.organic is not None
-        else sorted(p.stem for p in organic_dir.glob("*.json"))
-    )
-    for name in names:
-        src = json.loads((organic_dir / f"{name}.json").read_text())
-        user_turns = [t["content"] for t in src["turns"] if t["role"] == "user"][
-            : args.organic_turns
-        ]
+    for name, (src, user_turns) in organic.items():
         conv = []
         with torch.no_grad():
             for u in user_turns:
@@ -588,7 +598,8 @@ def stage_sweep(args, models: Models):
                 "steer_layer": layer,
                 "category": "organic",
                 "probe_id": name,
-                "persona": src.get("persona"),
+                "user_persona": src.get("persona"),
+                "topic": src.get("topic"),
                 "conversation": conv,
             }
         )
