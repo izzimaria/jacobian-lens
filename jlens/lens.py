@@ -50,9 +50,10 @@ class JacobianLens:
         )
 
     def save(self, path: str, *, dtype: torch.dtype = torch.float16) -> None:
-        """Save to ``path``. Jacobians are stored as ``dtype`` (default fp16:
+        """Save to ``path`` (atomically: temp file + rename). Jacobians are stored as ``dtype`` (default fp16:
         halves file size; entries are O(1) so the range is not a constraint
         and fp16's extra mantissa bits beat bf16 here)."""
+        tmp_path = f"{path}.tmp.{os.getpid()}"
         torch.save(
             {
                 "J": {layer: J.to(dtype) for layer, J in self.jacobians.items()},
@@ -60,8 +61,9 @@ class JacobianLens:
                 "source_layers": self.source_layers,
                 "d_model": self.d_model,
             },
-            path,
+            tmp_path,
         )
+        os.replace(tmp_path, path)
 
     @classmethod
     def load(cls, path: str) -> JacobianLens:
