@@ -27,7 +27,7 @@ This experiment links two codebases:
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/izzimaria/jacobian-lens/blob/devin/1795312846-persona-drift/experiments/persona_drift/colab.ipynb)
 
-`colab.ipynb`: pick an **L4** runtime, optionally add `OPENAI_API_KEY` under Colab Secrets, then **Run all**. Output goes to Google Drive, so after a disconnect you can choose *Run all* again and it resumes. To keep Drive usage to about 1 GB, `--scratch_dir /content/scratch` keeps the 1.3 GB fit checkpoint and the axis activations on the Colab disk (a disconnect mid-fit restarts the fit; pass `--fit_sync_every N` to copy the checkpoint to Drive every N prompts). Defaults: 100 lens-fit prompts and a fixed-seed sample of 100 roles × 5 variants × 10 questions for the axis. Generation uses batched HF `generate` because Colab has no vLLM.
+`colab.ipynb`: pick an **L4** runtime, optionally add `OPENAI_API_KEY` under Colab Secrets, then **Run all**. Output goes to Google Drive, so after a disconnect you can choose *Run all* again and it resumes. To keep Drive usage to about 1 GB, `--scratch_dir /content/scratch` keeps the 1.3 GB fit checkpoint and the axis activations on the Colab disk (a disconnect mid-fit restarts the fit; pass `--fit_sync_every N` to copy the checkpoint to Drive every N prompts). Scratch data is kept per output directory, and each stage records its inputs in `stage_inputs.json`: rerunning into an existing `--out` with different settings (strengths, roles, token sets, …) stops with an error instead of reusing stale results, so use a fresh `--out` for a new configuration. Final files are written to a temp file and renamed, so a disconnect mid-save never leaves a partial `lens.pt` that is mistaken for a finished one. Defaults: 100 lens-fit prompts and a fixed-seed sample of 100 roles × 5 variants × 10 questions for the axis. Generation uses batched HF `generate` because Colab has no vLLM.
 
 ## Setup
 
@@ -107,7 +107,10 @@ Outputs in `--out`:
   the first layer reaching half the maximum of each.
 - **Lead.** Per transcript: first response position where the persona set enters the band
   (`first_band_hit_pos`) vs first position whose emitted token is a persona word
-  (`first_emit_pos`); `frac_band_before_emit` and `median_lead_tokens` per `s`.
+  (`first_emit_pos`); per `s`, `frac_band_before_emit` (among transcripts that emit a persona
+  word; `null` if none do), `frac_band_hit_no_emit` (band hit but no persona word emitted) and
+  `median_lead_tokens`. Positions whose next token is chat-template markup (e.g. the `<|im_end|>`
+  appended after a response cut off at `max_new_tokens`) are not scored.
 
 ## Results
 
@@ -130,9 +133,10 @@ findings.
   rises only after it: it starts at layer 13 and peaks near layer 19, with a +0.66 hit-rate gain at s = −8.
 - At s = −8, persona words are lens-readable in the band about 20× more often than they are emitted
   (0.69 vs 0.035), and the assistant set falls out of the band.
-- **The lead question is not answered yet.** `frac_band_before_emit` is already 0.92 at s = 0,
-  because a 2-prompt lens makes many band hits on its own. So "band before emission" does not
-  separate steered from unsteered runs at this scale. For the real run, compare against the s = 0
+- **The lead question is not answered yet.** Among transcripts that emit a persona word,
+  `frac_band_before_emit` is 0.73 at s = −8 (11 of 12 emit) but 1.0 at s = 0 (2 of 12 emit), and
+  90% of non-emitting s = 0 transcripts still hit the band, because a 2-prompt lens makes many band
+  hits on its own. So "band before emission" does not separate steered from unsteered runs at this scale. For the real run, compare against the s = 0
   baseline, not the absolute fraction.
 
 Next: the full run on one GPU (Qwen2.5-7B-Instruct, `--n_fit_prompts 100`+, default strengths, all

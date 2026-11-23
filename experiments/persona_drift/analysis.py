@@ -25,6 +25,10 @@ def load(out_dir) -> tuple[dict, list[dict]]:
     rs = [
         json.loads(p.read_text()) for p in sorted((out_dir / "readout").glob("*.json"))
     ]
+    manifest = out_dir / "transcripts.json"
+    if manifest.exists():
+        ids = {rec["id"] for rec in json.loads(manifest.read_text())["records"]}
+        rs = [r for r in rs if r["id"] in ids]
     for r in rs:
         for k in r["ranks"]:
             r["ranks"][k] = np.asarray(r["ranks"][k])
@@ -95,6 +99,7 @@ def lead_stats(meta, group, hit_rank: int, name: str = "persona") -> dict:
         t_ws.append(first_true(band_min(r, meta, name) < hit_rank))
         t_out.append(first_true(np.asarray(r["emitted_in_set"][name])))
         t_final.append(first_true(r["ranks"][name][-1] < hit_rank))
+    emitted = [(w, o) for w, o in zip(t_ws, t_out, strict=True) if o is not None]
     both = [
         (w, o)
         for w, o in zip(t_ws, t_out, strict=True)
@@ -104,14 +109,19 @@ def lead_stats(meta, group, hit_rank: int, name: str = "persona") -> dict:
         f"{name}_frac_band_hit": float(np.mean([t is not None for t in t_ws])),
         f"{name}_frac_emitted": float(np.mean([t is not None for t in t_out])),
         f"{name}_frac_output_hit": float(np.mean([t is not None for t in t_final])),
+        # Ordering is only defined where a persona word was actually emitted.
         f"{name}_frac_band_before_emit": float(
+            np.mean([w is not None and w < o for w, o in emitted])
+        )
+        if emitted
+        else None,
+        f"{name}_frac_band_hit_no_emit": float(
             np.mean(
-                [
-                    w is not None and (o is None or w < o)
-                    for w, o in zip(t_ws, t_out, strict=True)
-                ]
+                [w is not None for w, o in zip(t_ws, t_out, strict=True) if o is None]
             )
-        ),
+        )
+        if any(o is None for o in t_out)
+        else None,
         f"{name}_median_lead_tokens": float(np.median([o - w for w, o in both]))
         if both
         else None,
@@ -354,7 +364,7 @@ def _jsonable(x):
 def run(out_dir, hit_rank: int | None = None) -> dict:
     out_dir = Path(out_dir)
     meta, rs = load(out_dir)
-    hit_rank = hit_rank or meta["hit_rank"]
+    hit_rank = meta["hit_rank"] if hit_rank is None else hit_rank
     figs = out_dir / "figures"
     figs.mkdir(exist_ok=True)
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import importlib.util
 import json
 import logging
@@ -171,8 +172,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--hit_rank",
         type=int,
-        default=10,
-        help="rank threshold (0-based <) counted as 'readable'",
+        default=None,
+        help="rank threshold (0-based <) counted as 'readable' "
+        "(default: the saved readout value, else 10)",
     )
     p.add_argument(
         "--slice_probe",
@@ -220,9 +222,62 @@ class Models:
             torch.cuda.empty_cache()
 
 
-def save_json(obj, path: Path):
+def atomic_write(path: Path, write) -> None:
+    """``write(tmp_path)`` then rename over ``path``, so an interrupted write
+    never leaves a partial file that a resumed run would treat as complete."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=1, ensure_ascii=False))
+    tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def save_json(obj, path: Path):
+    atomic_write(
+        path, lambda t: t.write_text(json.dumps(obj, indent=1, ensure_ascii=False))
+    )
+
+
+def _file_sha(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+
+
+def check_stage(args, stage: str, sig: dict, *, exists: bool) -> None:
+    """Refuse to reuse a stage's outputs that were made with different inputs.
+
+    Signatures live in ``{out}/stage_inputs.json``; outputs from before they
+    were recorded are adopted as-is.
+    """
+    path = args.out / "stage_inputs.json"
+    sigs = json.loads(path.read_text()) if path.exists() else {}
+    sig = json.loads(json.dumps(sig, default=str))
+    old = sigs.get(stage)
+    if exists and old is not None and old != sig:
+        diff = sorted(k for k in sig.keys() | old.keys() if sig.get(k) != old.get(k))
+        raise SystemExit(
+            f"{stage}: existing outputs in {args.out} were made with different "
+            f"{', '.join(diff)}. Use a fresh --out, or delete this stage's outputs "
+            "and those of later stages to rebuild them."
+        )
+    if old != sig:
+        sigs[stage] = sig
+        save_json(sigs, path)
+
+
+def scratch(args) -> Path | None:
+    """Per-output-dir scratch, so two runs sharing --scratch_dir never mix data."""
+    if not args.scratch_dir:
+        return None
+    key = hashlib.sha256(str(args.out.resolve()).encode()).hexdigest()[:12]
+    return (args.scratch_dir / key).resolve()
+
+
+def copy_atomic(src, dst) -> None:
+    atomic_write(Path(dst), lambda t: shutil.copyfile(src, t))
 
 
 def chat_ids(tok, conversation, model_name) -> list[int]:
@@ -244,9 +299,24 @@ def chat_ids(tok, conversation, model_name) -> list[int]:
 
 def stage_fit(args, models: Models):
     path = args.out / "lens.pt"
+    check_stage(
+        args,
+        "fit",
+        {
+            "model": args.model,
+            "n_fit_prompts": args.n_fit_prompts,
+            "fit_seq_len": args.fit_seq_len,
+        },
+        exists=path.exists() or (args.out / "lens_ckpt.pt").exists(),
+    )
     if path.exists():
-        log.info("lens exists at %s, skipping fit", path)
-        return
+        try:
+            jlens.JacobianLens.load(str(path))
+            log.info("lens exists at %s, skipping fit", path)
+            return
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s is unreadable (%s); refitting", path, e)
+            path.unlink()
     from jlens.examples import load_wikitext_prompts
 
     _, _, lens_model = models.get()
@@ -261,18 +331,24 @@ def stage_fit(args, models: Models):
     # leaves a trashed copy, so checkpoint to --scratch_dir and mirror to
     # --out only every --fit_sync_every prompts.
     synced = args.out / "lens_ckpt.pt"
-    ckpt = args.scratch_dir / "lens_ckpt.pt" if args.scratch_dir else synced
+    ckpt = scratch(args) / "lens_ckpt.pt" if args.scratch_dir else synced
     step = len(prompts)
     done = 0
     if ckpt != synced:
         ckpt.parent.mkdir(parents=True, exist_ok=True)
         if synced.exists() and not ckpt.exists():
             log.info("copying %s -> %s", synced, ckpt)
-            shutil.copyfile(synced, ckpt)
-        if ckpt.exists():
-            done = torch.load(ckpt, map_location="cpu", mmap=True, weights_only=True)[
-                "n_done"
-            ]
+            copy_atomic(synced, ckpt)
+    if ckpt.exists():
+        done = torch.load(ckpt, map_location="cpu", mmap=True, weights_only=True)[
+            "next_idx"
+        ]
+        if done > len(prompts):
+            raise SystemExit(
+                f"{ckpt} already covers {done} prompts but --n_fit_prompts is "
+                f"{len(prompts)}; use a fresh --out or delete the checkpoint"
+            )
+    if ckpt != synced:
         step = args.fit_sync_every or len(prompts)
     for end in range(step, len(prompts) + step, step):
         end = min(end, len(prompts))
@@ -285,7 +361,7 @@ def stage_fit(args, models: Models):
         )
         if ckpt != synced and end < len(prompts) and lens.n_prompts > done:
             log.info("syncing checkpoint (%d prompts) -> %s", lens.n_prompts, synced)
-            shutil.copyfile(ckpt, synced)
+            copy_atomic(ckpt, synced)
             done = lens.n_prompts
     lens.save(str(path))
     log.info("saved %r -> %s", lens, path)
@@ -306,7 +382,10 @@ def _run_pipeline_script(args, script: str, *script_args):
         *map(str, script_args),
     ]
     log.info("$ %s", " ".join(cmd))
-    subprocess.run(cmd, check=True, cwd=args.assistant_axis_dir / "pipeline")
+    env = dict(os.environ)
+    if args.device == "cpu":
+        env["CUDA_VISIBLE_DEVICES"] = ""
+    subprocess.run(cmd, check=True, cwd=args.assistant_axis_dir / "pipeline", env=env)
 
 
 def _axis_roles(args) -> list[str]:
@@ -437,23 +516,49 @@ def _write_unjudged_scores(roles, responses_dir: Path, scores_dir: Path):
 
 def stage_axis(args, models: Models):
     path = args.out / "axis.pt"
-    if path.exists():
-        log.info("axis exists at %s, skipping", path)
-        return
     work = (args.out / "axis_pipeline").resolve()
     responses, acts, scores, vectors = (
         work / d for d in ("responses", "activations", "scores", "vectors")
     )
     if args.scratch_dir:
-        acts = (args.scratch_dir / "axis_activations").resolve()
-    for d in (responses, acts, scores, vectors):
-        d.mkdir(parents=True, exist_ok=True)
+        acts = scratch(args) / "axis_activations"
     roles = _axis_roles(args)
     data = args.assistant_axis_dir / "data"
+    judge = (
+        args.judge
+        if args.judge != "auto"
+        else ("openai" if os.environ.get("OPENAI_API_KEY") else "none")
+    )
+    check_stage(
+        args,
+        "axis",
+        {
+            "model": args.model,
+            "roles": roles,
+            "axis_question_count": args.axis_question_count,
+            "axis_prompt_indices": args.axis_prompt_indices,
+            "axis_max_tokens": args.axis_max_tokens,
+            "min_count": args.min_count,
+            "judge": judge,
+        },
+        exists=path.exists() or (responses.exists() and any(responses.iterdir())),
+    )
+    if path.exists():
+        try:
+            torch.load(path, map_location="cpu", weights_only=True)["unit"]
+            log.info("axis exists at %s, skipping", path)
+            return
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s is unreadable (%s); rebuilding", path, e)
+            path.unlink()
+    for d in (responses, acts, scores, vectors):
+        d.mkdir(parents=True, exist_ok=True)
 
+    if args.generator == "vllm" and args.device != "cuda":
+        raise SystemExit("--generator vllm needs --device cuda")
     use_vllm = args.generator == "vllm" or (
         args.generator == "auto"
-        and torch.cuda.is_available()
+        and args.device == "cuda"
         and importlib.util.find_spec("vllm") is not None
     )
     if use_vllm:
@@ -499,11 +604,6 @@ def stage_axis(args, models: Models):
         *roles,
     )
 
-    judge = (
-        args.judge
-        if args.judge != "auto"
-        else ("openai" if os.environ.get("OPENAI_API_KEY") else "none")
-    )
     if judge == "openai":
         _run_pipeline_script(
             args,
@@ -545,23 +645,21 @@ def stage_axis(args, models: Models):
     axis_norm = raw.norm(dim=-1)
     unit = raw / axis_norm.clamp_min(1e-8)[:, None]
     default_acts = torch.stack(
-        list(torch.load(acts / "default.pt", weights_only=False).values())
+        list(torch.load(acts / "default.pt", weights_only=True).values())
     ).float()
     resid_norm = default_acts.norm(dim=-1).mean(
         0
     )  # mean per-layer residual norm over default responses
-    torch.save(
-        {
-            "unit": unit,
-            "axis_norm": axis_norm,
-            "resid_norm": resid_norm,
-            "raw": raw,
-            "judge": judge,
-            "roles": roles,
-            "model": args.model,
-        },
-        path,
-    )
+    bundle = {
+        "unit": unit,
+        "axis_norm": axis_norm,
+        "resid_norm": resid_norm,
+        "raw": raw,
+        "judge": judge,
+        "roles": roles,
+        "model": args.model,
+    }
+    atomic_write(path, lambda t: torch.save(bundle, t))
     log.info(
         "saved unit axis %s (judge=%s, %d roles) -> %s",
         tuple(unit.shape),
@@ -577,7 +675,7 @@ def stage_axis(args, models: Models):
 
 
 def load_axis_bundle(args):
-    bundle = torch.load(args.out / "axis.pt", weights_only=False)
+    bundle = torch.load(args.out / "axis.pt", weights_only=True)
     from assistant_axis import get_config
 
     layer = (
@@ -613,17 +711,34 @@ def condition_name(s: float) -> str:
 
 def stage_sweep(args, models: Models):
     path = args.out / "transcripts.json"
-    if path.exists():
-        log.info("transcripts exist at %s, skipping", path)
-        return
-    from assistant_axis import generate_response
-
     organic_dir = args.assistant_axis_dir / "transcripts/persona_drift"
     names = (
         args.organic
         if args.organic is not None
         else sorted(p.stem for p in organic_dir.glob("*.json"))
     )
+    check_stage(
+        args,
+        "sweep",
+        {
+            "model": args.model,
+            "strengths": args.strengths,
+            "scale": args.scale,
+            "steer_layer": args.steer_layer,
+            "probes": _file_sha(args.probes),
+            "max_new_tokens": args.max_new_tokens,
+            "organic": names,
+            "organic_turns": args.organic_turns,
+            "organic_max_new_tokens": args.organic_max_new_tokens,
+        },
+        exists=path.exists(),
+    )
+    if path.exists():
+        json.loads(path.read_text())["records"]
+        log.info("transcripts exist at %s, skipping", path)
+        return
+    from assistant_axis import generate_response
+
     organic = {}
     for name in names:
         src = json.loads((organic_dir / f"{name}.json").read_text())
@@ -747,9 +862,14 @@ def readout_one(rec, models, lens, bundle, token_sets, args) -> dict:
     ids = chat_ids(tok, conv, args.model)[: args.max_seq_len]
     enc = ConversationEncoder(tok, args.model)
     turns = enc.response_indices(conv, per_turn=True, **chat_kwargs(args.model))
+    # Skip positions whose next token is template markup (e.g. the <|im_end|>
+    # the chat template appends even when generation stopped at max_new_tokens).
+    special = set(tok.all_special_ids) | {
+        i for i, t in tok.added_tokens_decoder.items() if t.special
+    }
     positions, turn_of = [], []
     for t, idx in enumerate(turns):
-        keep = [p for p in idx if p + 1 < len(ids)]
+        keep = [p for p in idx if p + 1 < len(ids) and ids[p + 1] not in special]
         positions += keep
         turn_of += [t] * len(keep)
     n_layers = lm.n_layers
@@ -831,15 +951,33 @@ def stage_readout(args, models: Models):
     bundle, _, _ = load_axis_bundle(args)
     transcripts = json.loads((args.out / "transcripts.json").read_text())
     words = json.loads(Path(args.token_sets).read_text())
+    check_stage(
+        args,
+        "readout",
+        {
+            "model": args.model,
+            "token_sets": words,
+            "top_k": args.top_k,
+            "max_seq_len": args.max_seq_len,
+            "slice_probe": args.slice_probe,
+            "targets": "generated_only",
+        },
+        exists=any(out_dir.glob("*.json")),
+    )
     token_sets = {name: token_set_ids(tok, ws) for name, ws in words.items()}
     band = args.band or default_band(lm.n_layers)
+    meta_path = args.out / "readout_meta.json"
+    hit_rank = args.hit_rank
+    if hit_rank is None:
+        old = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        hit_rank = old.get("hit_rank", 10)
     save_json(
         {
             "token_sets": {
                 k: {str(i): v for i, v in d.items()} for k, d in token_sets.items()
             },
             "band": list(band),
-            "hit_rank": args.hit_rank,
+            "hit_rank": hit_rank,
             "source_layers": lens.source_layers,
             "n_layers": lm.n_layers,
             **{
@@ -847,19 +985,22 @@ def stage_readout(args, models: Models):
                 for k in ("model", "steer_layer", "scale_mode", "scale")
             },
         },
-        args.out / "readout_meta.json",
+        meta_path,
     )
     for rec in transcripts["records"]:
         f = out_dir / f"{rec['id']}.json"
         if f.exists():
             continue
         r = readout_one(rec, models, lens, bundle, token_sets, args)
-        np.savez_compressed(
-            out_dir / f"{rec['id']}_topk.npz",
-            top_ids=r.pop("_top_ids"),
-            layers=r["layers"],
-            positions=r["positions"],
-        )
+        top_ids = r.pop("_top_ids")
+
+        def write_npz(t, r=r, top_ids=top_ids):
+            with open(t, "wb") as fh:
+                np.savez_compressed(
+                    fh, top_ids=top_ids, layers=r["layers"], positions=r["positions"]
+                )
+
+        atomic_write(out_dir / f"{rec['id']}_topk.npz", write_npz)
         save_json(r, f)
         log.info("readout %s (%d positions)", rec["id"], len(r["positions"]))
 
@@ -903,7 +1044,7 @@ def stage_readout(args, models: Models):
             f"{rec['steer_layer']}) | probe {rec['probe_id']} | last assistant turn",
             pinned_token_ids=pinned,
         )
-        page_path.write_text(page)
+        atomic_write(page_path, lambda t, page=page: t.write_text(page))
         log.info("slice page -> %s", page_path)
 
 
@@ -932,15 +1073,15 @@ def main(argv=None):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     args = parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
-    save_json(
-        {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-        args.out / "config.json",
-    )
     models = Models(args)
     for stage in STAGES:
         if stage in args.stages:
             log.info("=== stage: %s ===", stage)
             globals()[f"stage_{stage}"](args, models)
+    save_json(
+        {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        args.out / "config.json",
+    )
 
 
 if __name__ == "__main__":
